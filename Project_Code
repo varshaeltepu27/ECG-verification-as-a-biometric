@@ -1,0 +1,144 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, BatchNormalization, ReLU, Add, Dense, GlobalAveragePooling1D
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from sklearn.model_selection import train_test_split
+import scipy.signal
+import matplotlib.pyplot as plt
+
+# Load and preprocess the training data
+df = pd.read_excel('/content/17PersonsTrainData.xlsx')
+
+# Inspect the loaded data
+print("DataFrame after loading and preprocessing:")
+print(df.head())
+
+# Extract names and ECG data
+individuals = df.iloc[:, 0].values
+ecg_data = df.iloc[:, 1:].values  # ECG data starts from the second column
+
+# Check shapes of the data
+print(f"Shape of individuals array: {individuals.shape}")
+print(f"Shape of ECG data array: {ecg_data.shape}")
+
+# Encode labels
+labels_encoded = pd.factorize(individuals)[0]
+
+# Function to detect R-peaks
+def detect_r_peaks(ecg_signal, distance=150):
+    peaks, _ = scipy.signal.find_peaks(ecg_signal, distance=distance)
+    print(f"Detected R-peaks: {peaks}")  # Debug: print detected peaks
+    return peaks
+
+# Function to extract PQRS features
+def extract_pqrs_features(ecg_signal):
+    r_peaks = detect_r_peaks(ecg_signal)
+    if len(r_peaks) == 0:
+        print("No R-peaks detected")
+        return np.array([])  # Return an empty array if no R-peaks are found
+
+    features = []
+    for r_peak in r_peaks:
+        p_peak = max(0, r_peak - 20)
+        q_peak = max(0, r_peak - 10)
+        s_peak = min(len(ecg_signal) - 1, r_peak + 10)
+        t_peak = min(len(ecg_signal) - 1, r_peak + 20)
+
+        pqrs_feature = [
+            ecg_signal[p_peak] if p_peak < len(ecg_signal) else 0,
+            ecg_signal[q_peak] if q_peak < len(ecg_signal) else 0,
+            ecg_signal[r_peak] if r_peak < len(ecg_signal) else 0,
+            ecg_signal[s_peak] if s_peak < len(ecg_signal) else 0,
+            ecg_signal[t_peak] if t_peak < len(ecg_signal) else 0
+        ]
+        features.append(pqrs_feature)
+
+    if not features:
+        print("No PQRS features extracted")
+    return np.array(features)
+
+# Extract PQRS features for all individuals
+pqrs_features_list = []
+for idx, ecg_signal in enumerate(ecg_data):
+    pqrs_features = extract_pqrs_features(ecg_signal)
+    if pqrs_features.size > 0:  # Only append non-empty features
+        pqrs_features_list.append(pqrs_features)
+    else:
+        print(f"Skipping signal at index {idx} with no valid PQRS features")
+
+if len(pqrs_features_list) == 0:
+    raise ValueError("No valid PQRS features extracted from ECG data.")
+
+# Pad sequences to the same length
+max_length = max(len(seq) for seq in pqrs_features_list)
+pqrs_features_array = pad_sequences(pqrs_features_list, maxlen=max_length, padding='post', dtype='float32')
+
+# Normalize PQRS features
+scaler = MinMaxScaler()
+pqrs_features_array = scaler.fit_transform(pqrs_features_array.reshape(-1, pqrs_features_array.shape[-1]))
+pqrs_features_array = pqrs_features_array.reshape(len(pqrs_features_list), max_length, pqrs_features_array.shape[-1])
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(pqrs_features_array, labels_encoded, test_size=0.2, random_state=42)
+
+# Define the ResNet1D model
+def residual_block(x, filters, kernel_size):
+    shortcut = x
+    x = Conv1D(filters=filters, kernel_size=kernel_size, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    x = Conv1D(filters=filters, kernel_size=kernel_size, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Add()([x, shortcut])
+    x = ReLU()(x)
+    return x
+
+input_layer = Input(shape=(X_train.shape[1], X_train.shape[2]))
+x = Conv1D(filters=64, kernel_size=7, padding='same')(input_layer)
+x = BatchNormalization()(x)
+x = ReLU()(x)
+
+# Add residual blocks
+x = residual_block(x, 64, 3)
+x = residual_block(x, 64, 3)
+
+x = GlobalAveragePooling1D()(x)
+x = Dense(units=64, activation='relu')(x)
+x = Dense(units=len(np.unique(labels_encoded)), activation='softmax')(x)
+
+model = Model(inputs=input_layer, outputs=x)
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+model.summary()
+
+# Train the ResNet1D model
+history = model.fit(X_train, y_train, epochs=500, batch_size=32, validation_data=(X_test, y_test))
+
+# Evaluate on test set
+test_loss, test_accuracy = model.evaluate(X_test, y_test)
+print(f'Test Accuracy: {test_accuracy:.4f}')
+
+# Example prediction function
+def classify_ecg(ecg_signal):
+    pqrs_features = extract_pqrs_features(ecg_signal)
+    if pqrs_features.size == 0:
+        raise ValueError("No PQRS features extracted from ECG signal.")
+
+    pqrs_features_array = pad_sequences([pqrs_features], maxlen=max_length, padding='post', dtype='float32')
+    pqrs_features_array = scaler.transform(pqrs_features_array.reshape(-1, pqrs_features_array.shape[-1]))
+    pqrs_features_array = pqrs_features_array.reshape(1, max_length, pqrs_features_array.shape[-1])
+    predictions = model.predict(pqrs_features_array)
+    predicted_class = np.argmax(predictions, axis=1)[0]
+    return predicted_class
+
+# Example usage
+    test_ecg_signal = X_test[0].flatten()  # Replace with your test ECG signal
+    predicted_label = classify_ecg(test_ecg_signal)
+    print(f'Input row (example): {test_ecg_signal.flatten()}')
+    print(f'Predicted label: {predicted_label}')
+#except IndexError as e:
+    #print(f"Error with the test data: {e}")
+#except ValueError as e:
+    #print(f"Error with the PQRS feature extraction: {e}")
